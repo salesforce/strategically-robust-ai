@@ -1,0 +1,123 @@
+agent_policy:
+  clip_param: 0.3
+  entropy_coeff: 0.025
+  entropy_coeff_schedule: null
+  gamma: 0.998
+  grad_clip: 10.0
+  kl_coeff: 0.0
+  kl_target: 0.01
+  lambda: 0.98
+  lr:
+    SWEEP:
+    - 0.003
+  lr_schedule: null
+  model:
+    custom_model: ppo_fc
+    custom_model_config:
+      pre_logits_n:
+      - 32
+      pre_values_n:
+      - 32
+      shared_n: null
+    max_seq_len: 25
+  use_gae: true
+  vf_clip_param: 50.0
+  vf_loss_coeff: 0.05
+  vf_share_layers: false
+env:
+  action_perturb:
+    SWEEP:
+    - 0.01
+    - 0.1
+    - 0.4
+  env_name: cooptoy3
+  env_width:
+    SWEEP:
+    - 7
+  max_time: 500
+  n_agents: 3
+  num_players: 3
+  perturb:
+    SWEEP:
+    - 0.0
+  seed:
+    SWEEP:
+    - 0
+ermas:
+  alpha_lr: 0.001
+  epsilon: 20.0
+  initial_lambda: 8.0
+  metascale: 0.2
+  parallel: true
+  penalty: reptile
+  use_ermas: false
+  use_me_trainers: false
+  use_me_weight_sync: false
+general:
+  ckpt_frequency_steps: 5000000
+  cpus: 15
+  episodes: 10000
+  gpus: 0
+  num_training_agents: -1
+  remap: false
+  restore_tf_weights_agents: null
+  restore_tf_weights_planner: YOUR_EXPERIMENT_CKPTS/planner.tf.weights.global-step-latest
+  train_planner: false
+metadata:
+  experiment: coop_bimatrix_3/eval_act_perturb_concav
+  project: YourProjectName
+  version: v1
+planner_policy:
+  clip_param: 0.3
+  entropy_coeff: 0.1
+  entropy_coeff_schedule: null
+  gamma: 0.998
+  grad_clip: 10.0
+  kl_coeff: 0.0
+  kl_target: 0.01
+  lambda: 0.98
+  lr: 0.0006
+  lr_schedule: null
+  model:
+    custom_model: ppo_fc
+    custom_model_config:
+      pre_logits_n:
+      - 32
+      pre_values_n:
+      - 32
+      shared_n: null
+    max_seq_len: 25
+  use_gae: true
+  vf_clip_param: 50.0
+  vf_loss_coeff: 0.05
+  vf_share_layers: false
+trainer:
+  batch_mode: truncate_episodes
+  env_config: null
+  local_tf_session_args:
+    inter_op_parallelism_threads: 2
+    intra_op_parallelism_threads: 24
+  metrics_smoothing_episodes: null
+  multiagent: null
+  no_done_at_end: false
+  num_envs_per_worker: 4
+  num_gpus: 0
+  num_gpus_per_worker: 0
+  num_sgd_iter: 1
+  num_workers: 15
+  observation_filter: NoFilter
+  rollout_fragment_length: 250
+  seed: null
+  sgd_minibatch_size: 2500
+  shuffle_sequences: true
+  tf_session_args:
+    allow_soft_placement: true
+    device_count:
+      CPU: null
+      GPU: null
+    gpu_options:
+      allow_growth: true
+    inter_op_parallelism_threads: 2
+    intra_op_parallelism_threads: 24
+    log_device_placement: false
+  train_batch_size: 15000

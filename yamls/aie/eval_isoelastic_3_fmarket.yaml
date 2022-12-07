@@ -1,0 +1,150 @@
+agent_policy:
+  clip_param: 0.3
+  entropy_coeff: 0.025
+  entropy_coeff_schedule: null
+  gamma: 0.998
+  grad_clip: 10.0
+  kl_coeff: 0.0
+  kl_target: 0.01
+  lambda: 0.98
+  lr: 0.0003
+  lr_schedule: null
+  model:
+    custom_model: ppo_conv_lstm_old_style
+    custom_model_config:
+      fc_dim: 128
+      idx_emb_dim: 4
+      input_emb_vocab: 100
+      lstm_cell_size: 128
+      num_conv: 2
+      num_fc: 2
+    max_seq_len: 25
+  use_gae: true
+  vf_clip_param: 50.0
+  vf_loss_coeff: 0.05
+  vf_share_layers: false
+env:
+  components:
+  - Build:
+      build_labor: 10
+      payment: 10
+      payment_max_skill_multiplier: 3
+      skill_dist: pareto
+  - ContinuousDoubleAuction:
+      max_bid_ask: 10
+      max_num_orders: 5
+      order_duration: 50
+      order_labor: 0.25
+  - Gather:
+      collect_labor: 1
+      move_labor: 1
+      skill_dist: pareto
+  - PeriodicBracketTax:
+      bracket_spacing: us-federal
+      disable_taxes: true
+      period: 100
+      rate_disc: 0.05
+      tax_model: model_wrapper
+      usd_scaling: 1000
+  dense_log_frequency: 100
+  energy_cost: 0.21
+  energy_warmup_constant: 0
+  env_layout_file: quadrant_25x25_20each_30clump.txt
+  env_name: aie
+  episode_length: 1000
+  fixed_four_skill_and_loc: true
+  flatten_masks: true
+  flatten_observations: true
+  isoelastic_eta:
+    SWEEP:
+    - 0.11
+    - 0.19
+    - 0.23
+    - 0.27
+    - 0.35
+  multi_action_mode_agents: false
+  multi_action_mode_planner: true
+  n_agents: 4
+  planner_reward_type: coin_eq_times_productivity
+  scenario_name: layout_from_file/simple_wood_and_stone
+  starting_agent_coin: 0
+  world_size:
+  - 25
+  - 25
+ermas:
+  alpha_lr: 0.01
+  epsilon: 1.0
+  initial_lambda: 8.0
+  metascale: 0.2
+  parallel: true
+  penalty: reptile
+  use_ermas: false
+general:
+  ckpt_frequency_steps: 1000000
+  cpus: 15
+  episodes: 20000
+  gpus: 0
+  num_training_agents: -1
+  remap: true
+  restore_tf_weights_agents: AIE_FMARKET_AGENT_WEIGHTS
+  restore_tf_weights_planner: null
+  train_planner: false
+metadata:
+  experiment: aie/eval_isoelastic_3_fmarket
+  project: YourProjectName
+  version: v1
+planner_policy:
+  clip_param: 0.3
+  entropy_coeff: 0.125
+  entropy_coeff_schedule: null
+  gamma: 0.998
+  grad_clip: 10.0
+  kl_coeff: 0.0
+  kl_target: 0.01
+  lambda: 0.98
+  lr: 0.0001
+  lr_schedule: null
+  model:
+    custom_model: ppo_conv_lstm_old_style
+    custom_model_config:
+      fc_dim: 256
+      idx_emb_dim: 4
+      input_emb_vocab: 100
+      lstm_cell_size: 256
+      num_conv: 2
+      num_fc: 2
+    max_seq_len: 50
+  use_gae: true
+  vf_clip_param: 50.0
+  vf_loss_coeff: 0.05
+  vf_share_layers: false
+trainer:
+  batch_mode: truncate_episodes
+  env_config: null
+  local_tf_session_args:
+    inter_op_parallelism_threads: 2
+    intra_op_parallelism_threads: 24
+  metrics_smoothing_episodes: 60
+  multiagent: null
+  no_done_at_end: false
+  num_envs_per_worker: 4
+  num_gpus: 0
+  num_gpus_per_worker: 0
+  num_sgd_iter: 1
+  num_workers: 15
+  observation_filter: NoFilter
+  rollout_fragment_length: 200
+  seed: null
+  sgd_minibatch_size: 3000
+  shuffle_sequences: true
+  tf_session_args:
+    allow_soft_placement: true
+    device_count:
+      CPU: null
+      GPU: null
+    gpu_options:
+      allow_growth: true
+    inter_op_parallelism_threads: 2
+    intra_op_parallelism_threads: 24
+    log_device_placement: false
+  train_batch_size: 12000

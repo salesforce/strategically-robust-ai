@@ -1,0 +1,2009 @@
+diff --git a/rllib/agents/cppo/__init__.py b/rllib/agents/cppo/__init__.py
+new file mode 100644
+index 000000000..87252f35d
+--- /dev/null
++++ b/rllib/agents/cppo/__init__.py
+@@ -0,0 +1,8 @@
++from ray.rllib.agents.cppo.cppo import CPPOTrainer, DEFAULT_CONFIG
++from ray.rllib.agents.cppo.cppo_tf_policy import CPPOTFPolicy
++
++__all__ = [
++    "DEFAULT_CONFIG",
++    "CPPOTFPolicy",
++    "CPPOTrainer",
++]
+diff --git a/rllib/agents/cppo/cppo.py b/rllib/agents/cppo/cppo.py
+new file mode 100644
+index 000000000..216b28a6d
+--- /dev/null
++++ b/rllib/agents/cppo/cppo.py
+@@ -0,0 +1,221 @@
++import logging
++
++from ray.rllib.agents import with_common_config
++from ray.rllib.agents.cppo.cppo_tf_policy import CPPOTFPolicy
++from ray.rllib.agents.trainer_template import build_trainer
++from ray.rllib.execution.rollout_ops import ParallelRollouts, ConcatBatches, \
++    StandardizeFields, SelectExperiences
++from ray.rllib.execution.train_ops import TrainOneStep, TrainTFMultiGPU
++from ray.rllib.execution.metric_ops import StandardMetricsReporting
++
++logger = logging.getLogger(__name__)
++
++# yapf: disable
++# __sphinx_doc_begin__
++DEFAULT_CONFIG = with_common_config({
++    # Should use a critic as a baseline (otherwise don't use value baseline;
++    # required for using GAE).
++    "use_critic": True,
++    # If true, use the Generalized Advantage Estimator (GAE)
++    # with a value function, see https://arxiv.org/pdf/1506.02438.pdf.
++    "use_gae": True,
++    # The GAE(lambda) parameter.
++    "lambda": 1.0,
++    # Initial coefficient for KL divergence.
++    "kl_coeff": 0.2,
++    # Initial coefficient for c.
++    "c_coeff": 1.0,
++    # Size of batches collected from each worker.
++    "rollout_fragment_length": 200,
++    # Number of timesteps collected for each SGD round. This defines the size
++    # of each SGD epoch.
++    "train_batch_size": 4000,
++    # Total SGD batch size across all devices for SGD. This defines the
++    # minibatch size within each epoch.
++    "sgd_minibatch_size": 128,
++    # Whether to shuffle sequences in the batch when training (recommended).
++    "shuffle_sequences": True,
++    # Number of SGD iterations in each outer loop (i.e., number of epochs to
++    # execute per train batch).
++    "num_sgd_iter": 30,
++    # Stepsize of SGD.
++    "lr": 5e-5,
++    # Learning rate schedule.
++    "lr_schedule": None,
++    # Share layers for value function. If you set this to True, it's important
++    # to tune vf_loss_coeff.
++    "vf_share_layers": False,
++    # Coefficient of the value function loss. IMPORTANT: you must tune this if
++    # you set vf_share_layers: True.
++    "vf_loss_coeff": 1.0,
++    # Coefficient of the entropy regularizer.
++    "entropy_coeff": 0.0,
++    # Decay schedule for the entropy regularizer.
++    "entropy_coeff_schedule": None,
++    # PPO clip parameter.
++    "clip_param": 0.3,
++    # Clip param for the value function. Note that this is sensitive to the
++    # scale of the rewards. If your expected V is large, increase this.
++    "vf_clip_param": 10.0,
++    # If specified, clip the global norm of gradients by this amount.
++    "grad_clip": None,
++    # Target value for KL divergence.
++    "kl_target": 0.01,
++    # Whether to rollout "complete_episodes" or "truncate_episodes".
++    "batch_mode": "truncate_episodes",
++    # Which observation filter to apply to the observation.
++    "observation_filter": "NoFilter",
++    # Uses the sync samples optimizer instead of the multi-gpu one. This is
++    # usually slower, but you might want to try it if you run into issues with
++    # the default optimizer.
++    "simple_optimizer": False,
++    # Whether to fake GPUs (using CPUs).
++    # Set this to True for debugging on non-GPU machines (set `num_gpus` > 0).
++    "_fake_gpus": False,
++})
++# __sphinx_doc_end__
++# yapf: enable
++
++
++def warn_about_bad_reward_scales(config, result):
++    if result["policy_reward_mean"]:
++        return result  # Punt on handling multiagent case.
++
++    # Warn about excessively high VF loss.
++    learner_stats = result["info"]["learner"]
++    if "default_policy" in learner_stats:
++        scaled_vf_loss = (config["vf_loss_coeff"] *
++                          learner_stats["default_policy"]["vf_loss"])
++        policy_loss = learner_stats["default_policy"]["policy_loss"]
++        if config["vf_share_layers"] and scaled_vf_loss > 100:
++            logger.warning(
++                "The magnitude of your value function loss is extremely large "
++                "({}) compared to the policy loss ({}). This can prevent the "
++                "policy from learning. Consider scaling down the VF loss by "
++                "reducing vf_loss_coeff, or disabling vf_share_layers.".format(
++                    scaled_vf_loss, policy_loss))
++
++    # Warn about bad clipping configs
++    if config["vf_clip_param"] <= 0:
++        rew_scale = float("inf")
++    else:
++        rew_scale = round(
++            abs(result["episode_reward_mean"]) / config["vf_clip_param"], 0)
++    if rew_scale > 200:
++        logger.warning(
++            "The magnitude of your environment rewards are more than "
++            "{}x the scale of `vf_clip_param`. ".format(rew_scale) +
++            "This means that it will take more than "
++            "{} iterations for your value ".format(rew_scale) +
++            "function to converge. If this is not intended, consider "
++            "increasing `vf_clip_param`.")
++
++    return result
++
++
++def validate_config(config):
++    if config["entropy_coeff"] < 0:
++        raise DeprecationWarning("entropy_coeff must be >= 0")
++    if isinstance(config["entropy_coeff"], int):
++        config["entropy_coeff"] = float(config["entropy_coeff"])
++    if config["sgd_minibatch_size"] > config["train_batch_size"]:
++        raise ValueError("`sgd_minibatch_size` ({}) must be <= "
++                         "`train_batch_size` ({}).".format(
++                             config["sgd_minibatch_size"],
++                             config["train_batch_size"]))
++    if config["batch_mode"] == "truncate_episodes" and not config["use_gae"]:
++        raise ValueError(
++            "Episode truncation is not supported without a value "
++            "function. Consider setting batch_mode=complete_episodes.")
++    if config["multiagent"]["policies"] and not config["simple_optimizer"]:
++        logger.info(
++            "In multi-agent mode, policies will be optimized sequentially "
++            "by the multi-GPU optimizer. Consider setting "
++            "simple_optimizer=True if this doesn't work for you.")
++    if config["simple_optimizer"]:
++        logger.warning(
++            "Using the simple minibatch optimizer. This will significantly "
++            "reduce performance, consider simple_optimizer=False.")
++    # Multi-gpu not supported for PyTorch and tf-eager.
++    elif config["framework"] in ["tf2", "tfe", "torch"]:
++        config["simple_optimizer"] = True
++
++
++def get_policy_class(config):
++    if config["framework"] == "torch":
++        raise ValueError()
++    else:
++        return CPPOTFPolicy
++
++def update_constant(self, c_coeff):
++    """Callback to update the constant based on optimization info."""
++    def update(pi, pi_id):
++        if pi_id != "p":
++            pi.update_constant(c_coeff)
++    self.workers.local_worker().foreach_trainable_policy(update)
++
++
++class UpdateKL:
++    """Callback to update the KL based on optimization info."""
++
++    def __init__(self, workers):
++        self.workers = workers
++
++    def __call__(self, fetches):
++        def update(pi, pi_id):
++            assert "kl" not in fetches, (
++                "kl should be nested under policy id key", fetches)
++            if pi_id in fetches:
++                assert "kl" in fetches[pi_id], (fetches, pi_id)
++                pi.update_kl(fetches[pi_id]["kl"])
++            else:
++                logger.warning("No data for {}, not updating kl".format(pi_id))
++
++        self.workers.local_worker().foreach_trainable_policy(update)
++
++
++def execution_plan(workers, config):
++    rollouts = ParallelRollouts(workers, mode="bulk_sync")
++
++    # Collect large batches of relevant experiences & standardize.
++    rollouts = rollouts.for_each(
++        SelectExperiences(workers.trainable_policies()))
++    rollouts = rollouts.combine(
++        ConcatBatches(min_batch_size=config["train_batch_size"]))
++    rollouts = rollouts.for_each(StandardizeFields(["advantages"]))
++
++    if config["simple_optimizer"]:
++        train_op = rollouts.for_each(
++            TrainOneStep(
++                workers,
++                num_sgd_iter=config["num_sgd_iter"],
++                sgd_minibatch_size=config["sgd_minibatch_size"]))
++    else:
++        train_op = rollouts.for_each(
++            TrainTFMultiGPU(
++                workers,
++                sgd_minibatch_size=config["sgd_minibatch_size"],
++                num_sgd_iter=config["num_sgd_iter"],
++                num_gpus=config["num_gpus"],
++                rollout_fragment_length=config["rollout_fragment_length"],
++                num_envs_per_worker=config["num_envs_per_worker"],
++                train_batch_size=config["train_batch_size"],
++                shuffle_sequences=config["shuffle_sequences"],
++                _fake_gpus=config["_fake_gpus"],
++                framework=config.get("framework")))
++
++    # Update KL after each round of training.
++    train_op = train_op.for_each(lambda t: t[1]).for_each(UpdateKL(workers))
++
++    return StandardMetricsReporting(train_op, workers, config) \
++        .for_each(lambda result: warn_about_bad_reward_scales(config, result))
++
++
++CPPOTrainer = build_trainer(
++    name="CPPO",
++    default_config=DEFAULT_CONFIG,
++    default_policy=CPPOTFPolicy,
++    get_policy_class=get_policy_class,
++    execution_plan=execution_plan,
++    validate_config=validate_config)
++setattr(CPPOTrainer, "update_constant", update_constant)
+diff --git a/rllib/agents/cppo/cppo_tf_policy.py b/rllib/agents/cppo/cppo_tf_policy.py
+new file mode 100644
+index 000000000..e9b94afaf
+--- /dev/null
++++ b/rllib/agents/cppo/cppo_tf_policy.py
+@@ -0,0 +1,292 @@
++import logging
++
++import ray
++from ray.rllib.evaluation.postprocessing import compute_advantages, \
++    Postprocessing
++from ray.rllib.policy.sample_batch import SampleBatch
++from ray.rllib.policy.tf_policy import LearningRateSchedule, \
++    EntropyCoeffSchedule
++from ray.rllib.policy.tf_policy_template import build_tf_policy
++from ray.rllib.utils.framework import try_import_tf, get_variable
++from ray.rllib.utils.tf_ops import explained_variance, make_tf_callable
++
++tf1, tf, tfv = try_import_tf()
++
++logger = logging.getLogger(__name__)
++
++
++class CPPOLoss:
++    def __init__(self,
++                 dist_class,
++                 model,
++                 value_targets,
++                 advantages,
++                 actions,
++                 prev_logits,
++                 prev_actions_logp,
++                 vf_preds,
++                 curr_action_dist,
++                 value_fn,
++                 cur_kl_coeff,
++                 cur_c_coeff,
++                 valid_mask,
++                 entropy_coeff=0,
++                 clip_param=0.1,
++                 vf_clip_param=0.1,
++                 vf_loss_coeff=1.0,
++                 use_gae=True):
++        """Constructs the loss for Proximal Policy Objective.
++
++        Arguments:
++            dist_class: action distribution class for logits.
++            value_targets (Placeholder): Placeholder for target values; used
++                for GAE.
++            actions (Placeholder): Placeholder for actions taken
++                from previous model evaluation.
++            advantages (Placeholder): Placeholder for calculated advantages
++                from previous model evaluation.
++            prev_logits (Placeholder): Placeholder for logits output from
++                previous model evaluation.
++            prev_actions_logp (Placeholder): Placeholder for action prob output
++                from the previous (before update) Model evaluation.
++            vf_preds (Placeholder): Placeholder for value function output
++                from the previous (before update) Model evaluation.
++            curr_action_dist (ActionDistribution): ActionDistribution
++                of the current model.
++            value_fn (Tensor): Current value function output Tensor.
++            cur_kl_coeff (Variable): Variable holding the current CPPO KL
++                coefficient.
++            valid_mask (Optional[tf.Tensor]): An optional bool mask of valid
++                input elements (for max-len padded sequences (RNNs)).
++            entropy_coeff (float): Coefficient of the entropy regularizer.
++            clip_param (float): Clip parameter
++            vf_clip_param (float): Clip parameter for the value function
++            vf_loss_coeff (float): Coefficient of the value function loss
++            use_gae (bool): If true, use the Generalized Advantage Estimator.
++        """
++        if valid_mask is not None:
++
++            def reduce_mean_valid(t):
++                return tf.reduce_mean(tf.boolean_mask(t, valid_mask))
++
++        else:
++
++            def reduce_mean_valid(t):
++                return tf.reduce_mean(t)
++
++        prev_dist = dist_class(prev_logits, model)
++        # Make loss functions.
++        logp_ratio = tf.exp(curr_action_dist.logp(actions) - prev_actions_logp)
++        action_kl = prev_dist.kl(curr_action_dist)
++        self.mean_kl = reduce_mean_valid(action_kl)
++
++        curr_entropy = curr_action_dist.entropy()
++        self.mean_entropy = reduce_mean_valid(curr_entropy)
++
++        advantages = cur_c_coeff * advantages
++
++        surrogate_loss = tf.minimum(
++            advantages * logp_ratio,
++            advantages * tf.clip_by_value(logp_ratio, 1 - clip_param,
++                                          1 + clip_param))
++        self.mean_policy_loss = reduce_mean_valid(-surrogate_loss)
++
++        if use_gae:
++            vf_loss1 = tf.math.square(value_fn - value_targets)
++            vf_clipped = vf_preds + tf.clip_by_value(
++                value_fn - vf_preds, -vf_clip_param, vf_clip_param)
++            vf_loss2 = tf.math.square(vf_clipped - value_targets)
++            vf_loss = tf.maximum(vf_loss1, vf_loss2)
++            self.mean_vf_loss = reduce_mean_valid(vf_loss)
++            loss = reduce_mean_valid(
++                -surrogate_loss + cur_kl_coeff * action_kl +
++                vf_loss_coeff * vf_loss - entropy_coeff * curr_entropy)
++        else:
++            self.mean_vf_loss = tf.constant(0.0)
++            loss = reduce_mean_valid(-surrogate_loss +
++                                     cur_kl_coeff * action_kl -
++                                     entropy_coeff * curr_entropy)
++        self.loss = loss
++
++
++def cppo_surrogate_loss(policy, model, dist_class, train_batch):
++    logits, state = model.from_batch(train_batch)
++    action_dist = dist_class(logits, model)
++
++    mask = None
++    if state:
++        max_seq_len = tf.reduce_max(train_batch["seq_lens"])
++        mask = tf.sequence_mask(train_batch["seq_lens"], max_seq_len)
++        mask = tf.reshape(mask, [-1])
++
++    policy.loss_obj = CPPOLoss(
++        dist_class,
++        model,
++        train_batch[Postprocessing.VALUE_TARGETS],
++        train_batch[Postprocessing.ADVANTAGES],
++        train_batch[SampleBatch.ACTIONS],
++        train_batch[SampleBatch.ACTION_DIST_INPUTS],
++        train_batch[SampleBatch.ACTION_LOGP],
++        train_batch[SampleBatch.VF_PREDS],
++        action_dist,
++        model.value_function(),
++        policy.kl_coeff,
++        policy.c_coeff,
++        mask,
++        entropy_coeff=policy.entropy_coeff,
++        clip_param=policy.config["clip_param"],
++        vf_clip_param=policy.config["vf_clip_param"],
++        vf_loss_coeff=policy.config["vf_loss_coeff"],
++        use_gae=policy.config["use_gae"],
++    )
++
++    return policy.loss_obj.loss
++
++
++def kl_and_loss_stats(policy, train_batch):
++    return {
++        "cur_kl_coeff": tf.cast(policy.kl_coeff, tf.float64),
++        "cur_c_coeff": tf.cast(policy.c_coeff, tf.float64),
++        "cur_lr": tf.cast(policy.cur_lr, tf.float64),
++        "total_loss": policy.loss_obj.loss,
++        "policy_loss": policy.loss_obj.mean_policy_loss,
++        "vf_loss": policy.loss_obj.mean_vf_loss,
++        "vf_explained_var": explained_variance(
++            train_batch[Postprocessing.VALUE_TARGETS],
++            policy.model.value_function()),
++        "kl": policy.loss_obj.mean_kl,
++        "entropy": policy.loss_obj.mean_entropy,
++        "entropy_coeff": tf.cast(policy.entropy_coeff, tf.float64),
++    }
++
++
++def vf_preds_fetches(policy):
++    """Adds value function outputs to experience train_batches."""
++    return {
++        SampleBatch.VF_PREDS: policy.model.value_function(),
++    }
++
++
++def postprocess_cppo_gae(policy,
++                        sample_batch,
++                        other_agent_batches=None,
++                        episode=None):
++    """Adds the policy logits, VF preds, and advantages to the trajectory."""
++
++    completed = sample_batch[SampleBatch.DONES][-1]
++    if completed:
++        last_r = 0.0
++    else:
++        next_state = []
++        for i in range(policy.num_state_tensors()):
++            next_state.append(sample_batch["state_out_{}".format(i)][-1])
++        last_r = policy._value(sample_batch[SampleBatch.NEXT_OBS][-1],
++                               sample_batch[SampleBatch.ACTIONS][-1],
++                               sample_batch[SampleBatch.REWARDS][-1],
++                               *next_state)
++    batch = compute_advantages(
++        sample_batch,
++        last_r,
++        policy.config["gamma"],
++        policy.config["lambda"],
++        use_gae=policy.config["use_gae"])
++    return batch
++
++
++def clip_gradients(policy, optimizer, loss):
++    variables = policy.model.trainable_variables()
++    if policy.config["grad_clip"] is not None:
++        grads_and_vars = optimizer.compute_gradients(loss, variables)
++        grads = [g for (g, v) in grads_and_vars]
++        policy.grads, _ = tf.clip_by_global_norm(grads,
++                                                 policy.config["grad_clip"])
++        clipped_grads = list(zip(policy.grads, variables))
++        return clipped_grads
++    else:
++        return optimizer.compute_gradients(loss, variables)
++
++
++class ConstantMixin:
++    def __init__(self, config):
++        # Lagrange multipliers
++        self.c_coeff_val = config["c_coeff"]
++        self.c_coeff = get_variable(float(self.c_coeff_val), tf_name="c_coeff", trainable=False)
++
++    def update_constant(self, new_constant):
++        self.c_coeff_val = new_constant
++        self.c_coeff.load(self.c_coeff_val, session=self.get_session())
++        return self.c_coeff_val
++
++
++class KLCoeffMixin:
++    def __init__(self, config):
++        # KL Coefficient
++        self.kl_coeff_val = config["kl_coeff"]
++        self.kl_target = config["kl_target"]
++        self.kl_coeff = get_variable(
++            float(self.kl_coeff_val), tf_name="kl_coeff", trainable=False)
++
++    def update_kl(self, sampled_kl):
++        if sampled_kl > 2.0 * self.kl_target:
++            self.kl_coeff_val *= 1.5
++        elif sampled_kl < 0.5 * self.kl_target:
++            self.kl_coeff_val *= 0.5
++        self.kl_coeff.load(self.kl_coeff_val, session=self.get_session())
++        return self.kl_coeff_val
++
++
++class ValueNetworkMixin:
++    def __init__(self, obs_space, action_space, config):
++        if config["use_gae"]:
++
++            @make_tf_callable(self.get_session())
++            def value(ob, prev_action, prev_reward, *state):
++                model_out, _ = self.model({
++                    SampleBatch.CUR_OBS: tf.convert_to_tensor([ob]),
++                    SampleBatch.PREV_ACTIONS: tf.convert_to_tensor(
++                        [prev_action]),
++                    SampleBatch.PREV_REWARDS: tf.convert_to_tensor(
++                        [prev_reward]),
++                    "is_training": tf.convert_to_tensor([False]),
++                }, [tf.convert_to_tensor([s]) for s in state],
++                                          tf.convert_to_tensor([1]))
++                return self.model.value_function()[0]
++
++        else:
++
++            @make_tf_callable(self.get_session())
++            def value(ob, prev_action, prev_reward, *state):
++                return tf.constant(0.0)
++
++        self._value = value
++
++
++def setup_config(policy, obs_space, action_space, config):
++    # auto set the model option for layer sharing
++    config["model"]["vf_share_layers"] = config["vf_share_layers"]
++
++
++def setup_mixins(policy, obs_space, action_space, config):
++    ValueNetworkMixin.__init__(policy, obs_space, action_space, config)
++    KLCoeffMixin.__init__(policy, config)
++    ConstantMixin.__init__(policy, config)
++    EntropyCoeffSchedule.__init__(policy, config["entropy_coeff"],
++                                  config["entropy_coeff_schedule"])
++    LearningRateSchedule.__init__(policy, config["lr"], config["lr_schedule"])
++
++
++CPPOTFPolicy = build_tf_policy(
++    name="CPPOTFPolicy",
++    get_default_config=lambda: ray.rllib.agents.cppo.cppo.DEFAULT_CONFIG,
++    loss_fn=cppo_surrogate_loss,
++    stats_fn=kl_and_loss_stats,
++    extra_action_fetches_fn=vf_preds_fetches,
++    postprocess_fn=postprocess_cppo_gae,
++    gradients_fn=clip_gradients,
++    before_init=setup_config,
++    before_loss_init=setup_mixins,
++    mixins=[
++        LearningRateSchedule, EntropyCoeffSchedule, KLCoeffMixin,
++        ValueNetworkMixin,
++        ConstantMixin,
++    ])
+diff --git a/rllib/agents/cppo/tests/test_appo.py b/rllib/agents/cppo/tests/test_appo.py
+new file mode 100644
+index 000000000..7161bb83a
+--- /dev/null
++++ b/rllib/agents/cppo/tests/test_appo.py
+@@ -0,0 +1,42 @@
++import unittest
++
++import ray
++import ray.rllib.agents.ppo as ppo
++from ray.rllib.utils.test_utils import check_compute_single_action, \
++    framework_iterator
++
++
++class TestAPPO(unittest.TestCase):
++    @classmethod
++    def setUpClass(cls):
++        ray.init()
++
++    @classmethod
++    def tearDownClass(cls):
++        ray.shutdown()
++
++    def test_appo_compilation(self):
++        """Test whether an APPOTrainer can be built with both frameworks."""
++        config = ppo.appo.DEFAULT_CONFIG.copy()
++        config["num_workers"] = 1
++        num_iterations = 2
++
++        for _ in framework_iterator(config, frameworks=("torch", "tf")):
++            _config = config.copy()
++            trainer = ppo.APPOTrainer(config=_config, env="CartPole-v0")
++            for i in range(num_iterations):
++                print(trainer.train())
++            check_compute_single_action(trainer)
++
++            _config = config.copy()
++            _config["vtrace"] = True
++            trainer = ppo.APPOTrainer(config=_config, env="CartPole-v0")
++            for i in range(num_iterations):
++                print(trainer.train())
++            check_compute_single_action(trainer)
++
++
++if __name__ == "__main__":
++    import pytest
++    import sys
++    sys.exit(pytest.main(["-v", __file__]))
+diff --git a/rllib/agents/cppo/tests/test_ddppo.py b/rllib/agents/cppo/tests/test_ddppo.py
+new file mode 100644
+index 000000000..4c56a22ee
+--- /dev/null
++++ b/rllib/agents/cppo/tests/test_ddppo.py
+@@ -0,0 +1,35 @@
++import unittest
++
++import ray
++import ray.rllib.agents.ppo as ppo
++from ray.rllib.utils.test_utils import check_compute_single_action, \
++    framework_iterator
++
++
++class TestDDPPO(unittest.TestCase):
++    @classmethod
++    def setUpClass(cls):
++        ray.init()
++
++    @classmethod
++    def tearDownClass(cls):
++        ray.shutdown()
++
++    def test_ddppo_compilation(self):
++        """Test whether a DDPPOTrainer can be built with both frameworks."""
++        config = ppo.ddppo.DEFAULT_CONFIG.copy()
++        config["num_gpus_per_worker"] = 0
++        num_iterations = 2
++
++        for _ in framework_iterator(config, "torch"):
++            trainer = ppo.ddppo.DDPPOTrainer(config=config, env="CartPole-v0")
++            for i in range(num_iterations):
++                trainer.train()
++            check_compute_single_action(trainer)
++            trainer.stop()
++
++
++if __name__ == "__main__":
++    import pytest
++    import sys
++    sys.exit(pytest.main(["-v", __file__]))
+diff --git a/rllib/agents/cppo/tests/test_ppo.py b/rllib/agents/cppo/tests/test_ppo.py
+new file mode 100644
+index 000000000..13aa9a5d5
+--- /dev/null
++++ b/rllib/agents/cppo/tests/test_ppo.py
+@@ -0,0 +1,365 @@
++import copy
++import numpy as np
++import unittest
++
++import ray
++import ray.rllib.agents.ppo as ppo
++from ray.rllib.agents.ppo.ppo_tf_policy import postprocess_ppo_gae as \
++    postprocess_ppo_gae_tf, ppo_surrogate_loss as ppo_surrogate_loss_tf
++from ray.rllib.agents.ppo.ppo_torch_policy import postprocess_ppo_gae as \
++    postprocess_ppo_gae_torch, ppo_surrogate_loss as ppo_surrogate_loss_torch
++from ray.rllib.evaluation.postprocessing import Postprocessing
++from ray.rllib.models.tf.tf_action_dist import Categorical
++from ray.rllib.models.torch.torch_modelv2 import TorchModelV2
++from ray.rllib.models.torch.torch_action_dist import TorchCategorical
++from ray.rllib.policy.sample_batch import SampleBatch
++from ray.rllib.utils.numpy import fc
++from ray.rllib.utils.test_utils import check, framework_iterator, \
++    check_compute_single_action
++
++
++# Fake CartPole episode of n time steps.
++FAKE_BATCH = {
++    SampleBatch.CUR_OBS: np.array(
++        [[0.1, 0.2, 0.3, 0.4], [0.5, 0.6, 0.7, 0.8], [0.9, 1.0, 1.1, 1.2]],
++        dtype=np.float32),
++    SampleBatch.ACTIONS: np.array([0, 1, 1]),
++    SampleBatch.PREV_ACTIONS: np.array([0, 1, 1]),
++    SampleBatch.REWARDS: np.array([1.0, -1.0, .5], dtype=np.float32),
++    SampleBatch.PREV_REWARDS: np.array([1.0, -1.0, .5], dtype=np.float32),
++    SampleBatch.DONES: np.array([False, False, True]),
++    SampleBatch.VF_PREDS: np.array([0.5, 0.6, 0.7], dtype=np.float32),
++    SampleBatch.ACTION_DIST_INPUTS: np.array(
++        [[-2., 0.5], [-3., -0.3], [-0.1, 2.5]], dtype=np.float32),
++    SampleBatch.ACTION_LOGP: np.array([-0.5, -0.1, -0.2], dtype=np.float32),
++}
++
++
++class TestPPO(unittest.TestCase):
++    @classmethod
++    def setUpClass(cls):
++        ray.init(local_mode=True)
++
++    @classmethod
++    def tearDownClass(cls):
++        ray.shutdown()
++
++    def test_ppo_compilation(self):
++        """Test whether a PPOTrainer can be built with all frameworks."""
++        config = copy.deepcopy(ppo.DEFAULT_CONFIG)
++        config["num_workers"] = 1
++        config["num_sgd_iter"] = 2
++        # Settings in case we use an LSTM.
++        config["model"]["lstm_cell_size"] = 10
++        config["model"]["max_seq_len"] = 20
++        config["train_batch_size"] = 128
++        num_iterations = 2
++
++        for _ in framework_iterator(config):
++            for env in ["CartPole-v0", "MsPacmanNoFrameskip-v4"]:
++                print("Env={}".format(env))
++                for lstm in [True, False]:
++                    print("LSTM={}".format(lstm))
++                    config["model"]["use_lstm"] = lstm
++                    config["model"]["lstm_use_prev_action_reward"] = lstm
++                    trainer = ppo.PPOTrainer(config=config, env=env)
++                    for i in range(num_iterations):
++                        trainer.train()
++                    check_compute_single_action(
++                        trainer,
++                        include_prev_action_reward=True,
++                        include_state=lstm)
++                    trainer.stop()
++
++    def test_ppo_fake_multi_gpu_learning(self):
++        """Test whether PPOTrainer can learn CartPole w/ faked multi-GPU."""
++        config = copy.deepcopy(ppo.DEFAULT_CONFIG)
++        # Fake GPU setup.
++        config["num_gpus"] = 2
++        config["_fake_gpus"] = True
++        config["framework"] = "tf"
++        # Mimick tuned_example for PPO CartPole.
++        config["num_workers"] = 1
++        config["lr"] = 0.0003
++        config["observation_filter"] = "MeanStdFilter"
++        config["num_sgd_iter"] = 6
++        config["vf_share_layers"] = True
++        config["vf_loss_coeff"] = 0.01
++        config["model"]["fcnet_hiddens"] = [32]
++        config["model"]["fcnet_activation"] = "linear"
++
++        trainer = ppo.PPOTrainer(config=config, env="CartPole-v0")
++        num_iterations = 200
++        learnt = False
++        for i in range(num_iterations):
++            results = trainer.train()
++            print(results)
++            if results["episode_reward_mean"] > 150:
++                learnt = True
++                break
++        assert learnt, "PPO multi-GPU (with fake-GPUs) did not learn CartPole!"
++        trainer.stop()
++
++    def test_ppo_exploration_setup(self):
++        """Tests, whether PPO runs with different exploration setups."""
++        config = copy.deepcopy(ppo.DEFAULT_CONFIG)
++        config["num_workers"] = 0  # Run locally.
++        config["env_config"] = {"is_slippery": False, "map_name": "4x4"}
++        obs = np.array(0)
++
++        # Test against all frameworks.
++        for fw in framework_iterator(config):
++            # Default Agent should be setup with StochasticSampling.
++            trainer = ppo.PPOTrainer(config=config, env="FrozenLake-v0")
++            # explore=False, always expect the same (deterministic) action.
++            a_ = trainer.compute_action(
++                obs,
++                explore=False,
++                prev_action=np.array(2),
++                prev_reward=np.array(1.0))
++            # Test whether this is really the argmax action over the logits.
++            if fw != "tf":
++                last_out = trainer.get_policy().model.last_output()
++                check(a_, np.argmax(last_out.numpy(), 1)[0])
++            for _ in range(50):
++                a = trainer.compute_action(
++                    obs,
++                    explore=False,
++                    prev_action=np.array(2),
++                    prev_reward=np.array(1.0))
++                check(a, a_)
++
++            # With explore=True (default), expect stochastic actions.
++            actions = []
++            for _ in range(300):
++                actions.append(
++                    trainer.compute_action(
++                        obs,
++                        prev_action=np.array(2),
++                        prev_reward=np.array(1.0)))
++            check(np.mean(actions), 1.5, atol=0.2)
++            trainer.stop()
++
++    def test_ppo_free_log_std(self):
++        """Tests the free log std option works."""
++        config = copy.deepcopy(ppo.DEFAULT_CONFIG)
++        config["num_workers"] = 0  # Run locally.
++        config["gamma"] = 0.99
++        config["model"]["fcnet_hiddens"] = [10]
++        config["model"]["fcnet_activation"] = "linear"
++        config["model"]["free_log_std"] = True
++        config["vf_share_layers"] = True
++
++        for fw, sess in framework_iterator(config, session=True):
++            trainer = ppo.PPOTrainer(config=config, env="CartPole-v0")
++            policy = trainer.get_policy()
++
++            # Check the free log std var is created.
++            if fw == "torch":
++                matching = [
++                    v for (n, v) in policy.model.named_parameters()
++                    if "log_std" in n
++                ]
++            else:
++                matching = [
++                    v for v in policy.model.trainable_variables()
++                    if "log_std" in str(v)
++                ]
++            assert len(matching) == 1, matching
++            log_std_var = matching[0]
++
++            def get_value():
++                if fw == "tf":
++                    return policy.get_session().run(log_std_var)[0]
++                elif fw == "torch":
++                    return log_std_var.detach().numpy()[0]
++                else:
++                    return log_std_var.numpy()[0]
++
++            # Check the variable is initially zero.
++            init_std = get_value()
++            assert init_std == 0.0, init_std
++
++            if fw in ["tf2", "tf", "tfe"]:
++                batch = postprocess_ppo_gae_tf(policy, FAKE_BATCH)
++            else:
++                batch = postprocess_ppo_gae_torch(policy, FAKE_BATCH)
++                batch = policy._lazy_tensor_dict(batch)
++            policy.learn_on_batch(batch)
++
++            # Check the variable is updated.
++            post_std = get_value()
++            assert post_std != 0.0, post_std
++            trainer.stop()
++
++    def test_ppo_loss_function(self):
++        """Tests the PPO loss function math."""
++        config = copy.deepcopy(ppo.DEFAULT_CONFIG)
++        config["num_workers"] = 0  # Run locally.
++        config["gamma"] = 0.99
++        config["model"]["fcnet_hiddens"] = [10]
++        config["model"]["fcnet_activation"] = "linear"
++        config["vf_share_layers"] = True
++
++        for fw, sess in framework_iterator(config, session=True):
++            trainer = ppo.PPOTrainer(config=config, env="CartPole-v0")
++            policy = trainer.get_policy()
++
++            # Check no free log std var by default.
++            if fw == "torch":
++                matching = [
++                    v for (n, v) in policy.model.named_parameters()
++                    if "log_std" in n
++                ]
++            else:
++                matching = [
++                    v for v in policy.model.trainable_variables()
++                    if "log_std" in str(v)
++                ]
++            assert len(matching) == 0, matching
++
++            # Post-process (calculate simple (non-GAE) advantages) and attach
++            # to train_batch dict.
++            # A = [0.99^2 * 0.5 + 0.99 * -1.0 + 1.0, 0.99 * 0.5 - 1.0, 0.5] =
++            # [0.50005, -0.505, 0.5]
++            if fw in ["tf2", "tf", "tfe"]:
++                train_batch = postprocess_ppo_gae_tf(policy, FAKE_BATCH)
++            else:
++                train_batch = postprocess_ppo_gae_torch(policy, FAKE_BATCH)
++                train_batch = policy._lazy_tensor_dict(train_batch)
++
++            # Check Advantage values.
++            check(train_batch[Postprocessing.VALUE_TARGETS],
++                  [0.50005, -0.505, 0.5])
++
++            # Calculate actual PPO loss.
++            if fw in ["tf2", "tfe"]:
++                ppo_surrogate_loss_tf(policy, policy.model, Categorical,
++                                      train_batch)
++            elif fw == "torch":
++                ppo_surrogate_loss_torch(policy, policy.model,
++                                         TorchCategorical, train_batch)
++
++            vars = policy.model.variables() if fw != "torch" else \
++                list(policy.model.parameters())
++            if fw == "tf":
++                vars = policy.get_session().run(vars)
++            expected_shared_out = fc(
++                train_batch[SampleBatch.CUR_OBS],
++                vars[0 if fw != "torch" else 2],
++                vars[1 if fw != "torch" else 3],
++                framework=fw)
++            expected_logits = fc(
++                expected_shared_out,
++                vars[2 if fw != "torch" else 0],
++                vars[3 if fw != "torch" else 1],
++                framework=fw)
++            expected_value_outs = fc(
++                expected_shared_out, vars[4], vars[5], framework=fw)
++
++            kl, entropy, pg_loss, vf_loss, overall_loss = \
++                self._ppo_loss_helper(
++                    policy, policy.model,
++                    Categorical if fw != "torch" else TorchCategorical,
++                    train_batch,
++                    expected_logits, expected_value_outs,
++                    sess=sess
++                )
++            if sess:
++                policy_sess = policy.get_session()
++                k, e, pl, v, tl = policy_sess.run(
++                    [
++                        policy.loss_obj.mean_kl, policy.loss_obj.mean_entropy,
++                        policy.loss_obj.mean_policy_loss,
++                        policy.loss_obj.mean_vf_loss, policy.loss_obj.loss
++                    ],
++                    feed_dict=policy._get_loss_inputs_dict(
++                        train_batch, shuffle=False))
++                check(k, kl)
++                check(e, entropy)
++                check(pl, np.mean(-pg_loss))
++                check(v, np.mean(vf_loss), decimals=4)
++                check(tl, overall_loss, decimals=4)
++            else:
++                check(policy.loss_obj.mean_kl, kl)
++                check(policy.loss_obj.mean_entropy, entropy)
++                check(policy.loss_obj.mean_policy_loss, np.mean(-pg_loss))
++                check(
++                    policy.loss_obj.mean_vf_loss, np.mean(vf_loss), decimals=4)
++                check(policy.loss_obj.loss, overall_loss, decimals=4)
++            trainer.stop()
++
++    def _ppo_loss_helper(self,
++                         policy,
++                         model,
++                         dist_class,
++                         train_batch,
++                         logits,
++                         vf_outs,
++                         sess=None):
++        """
++        Calculates the expected PPO loss (components) given Policy,
++        Model, distribution, some batch, logits & vf outputs, using numpy.
++        """
++        # Calculate expected PPO loss results.
++        dist = dist_class(logits, policy.model)
++        dist_prev = dist_class(train_batch[SampleBatch.ACTION_DIST_INPUTS],
++                               policy.model)
++        expected_logp = dist.logp(train_batch[SampleBatch.ACTIONS])
++        if isinstance(model, TorchModelV2):
++            expected_rho = np.exp(expected_logp.detach().numpy() -
++                                  train_batch.get(SampleBatch.ACTION_LOGP))
++            # KL(prev vs current action dist)-loss component.
++            kl = np.mean(dist_prev.kl(dist).detach().numpy())
++            # Entropy-loss component.
++            entropy = np.mean(dist.entropy().detach().numpy())
++        else:
++            if sess:
++                expected_logp = sess.run(expected_logp)
++            expected_rho = np.exp(expected_logp -
++                                  train_batch[SampleBatch.ACTION_LOGP])
++            # KL(prev vs current action dist)-loss component.
++            kl = dist_prev.kl(dist)
++            if sess:
++                kl = sess.run(kl)
++            kl = np.mean(kl)
++            # Entropy-loss component.
++            entropy = dist.entropy()
++            if sess:
++                entropy = sess.run(entropy)
++            entropy = np.mean(entropy)
++
++        # Policy loss component.
++        pg_loss = np.minimum(
++            train_batch.get(Postprocessing.ADVANTAGES) * expected_rho,
++            train_batch.get(Postprocessing.ADVANTAGES) * np.clip(
++                expected_rho, 1 - policy.config["clip_param"],
++                1 + policy.config["clip_param"]))
++
++        # Value function loss component.
++        vf_loss1 = np.power(
++            vf_outs - train_batch.get(Postprocessing.VALUE_TARGETS), 2.0)
++        vf_clipped = train_batch.get(SampleBatch.VF_PREDS) + np.clip(
++            vf_outs - train_batch.get(SampleBatch.VF_PREDS),
++            -policy.config["vf_clip_param"], policy.config["vf_clip_param"])
++        vf_loss2 = np.power(
++            vf_clipped - train_batch.get(Postprocessing.VALUE_TARGETS), 2.0)
++        vf_loss = np.maximum(vf_loss1, vf_loss2)
++
++        # Overall loss.
++        if sess:
++            policy_sess = policy.get_session()
++            kl_coeff, entropy_coeff = policy_sess.run(
++                [policy.kl_coeff, policy.entropy_coeff])
++        else:
++            kl_coeff, entropy_coeff = policy.kl_coeff, policy.entropy_coeff
++        overall_loss = np.mean(-pg_loss + kl_coeff * kl +
++                               policy.config["vf_loss_coeff"] * vf_loss -
++                               entropy_coeff * entropy)
++        return kl, entropy, pg_loss, vf_loss, overall_loss
++
++
++if __name__ == "__main__":
++    import pytest
++    import sys
++    sys.exit(pytest.main(["-v", __file__]))
+diff --git a/rllib/agents/registry.py b/rllib/agents/registry.py
+index 98be4a61b..19d9e6b30 100644
+--- a/rllib/agents/registry.py
++++ b/rllib/agents/registry.py
+@@ -44,6 +44,14 @@ def _import_ppo():
+     from ray.rllib.agents import ppo
+     return ppo.PPOTrainer
+ 
++def _import_wppo():
++    from ray.rllib.agents import wppo
++    return wppo.WPPOTrainer
++
++def _import_cppo():
++    from ray.rllib.agents import cppo
++    return cppo.CPPOTrainer
++
+ 
+ def _import_es():
+     from ray.rllib.agents import es
+@@ -106,6 +114,8 @@ ALGORITHMS = {
+     "APEX_DDPG": _import_apex_ddpg,
+     "TD3": _import_td3,
+     "PPO": _import_ppo,
++    "WPPO": _import_wppo,
++    "CPPO": _import_cppo,
+     "ES": _import_es,
+     "ARS": _import_ars,
+     "DQN": _import_dqn,
+diff --git a/rllib/agents/trainer.py b/rllib/agents/trainer.py
+index 400d8a287..ac1ff8cdb 100644
+--- a/rllib/agents/trainer.py
++++ b/rllib/agents/trainer.py
+@@ -185,6 +185,7 @@ COMMON_CONFIG: TrainerConfigDict = {
+     # Note that evaluation is currently not parallelized, and that for Ape-X
+     # metrics are already only reported for the lowest epsilon workers.
+     "evaluation_interval": None,
++    "force_evaluation": False,
+     # Number of episodes to run per evaluation period. If using multiple
+     # evaluation workers, we will run at least this many episodes total.
+     "evaluation_num_episodes": 10,
+@@ -643,7 +644,7 @@ class Trainer(Trainable):
+             self._init(self.config, self.env_creator)
+ 
+             # Evaluation setup.
+-            if self.config.get("evaluation_interval"):
++            if self.config.get("evaluation_interval") or self.config.get("force_evaluation"):
+                 # Update env_config with evaluation settings:
+                 extra_config = copy.deepcopy(self.config["evaluation_config"])
+                 # Assert that user has not unset "in_evaluation".
+diff --git a/rllib/agents/wppo/__init__.py b/rllib/agents/wppo/__init__.py
+new file mode 100644
+index 000000000..ae8a06661
+--- /dev/null
++++ b/rllib/agents/wppo/__init__.py
+@@ -0,0 +1,10 @@
++from ray.rllib.agents.wppo.wppo import WPPOTrainer, DEFAULT_CONFIG
++from ray.rllib.agents.wppo.lppo import LPPOTrainer
++from ray.rllib.agents.wppo.wppo_tf_policy import WPPOTFPolicy
++
++__all__ = [
++    "DEFAULT_CONFIG",
++    "WPPOTFPolicy",
++    "WPPOTrainer",
++    "LPPOTrainer",
++]
+diff --git a/rllib/agents/wppo/lppo.py b/rllib/agents/wppo/lppo.py
+new file mode 100644
+index 000000000..99253ff27
+--- /dev/null
++++ b/rllib/agents/wppo/lppo.py
+@@ -0,0 +1,240 @@
++import logging
++
++from ray.rllib.agents import with_common_config
++from ray.rllib.agents.ppo.ppo_tf_policy import PPOTFPolicy
++from ray.rllib.agents.trainer_template import build_trainer
++from ray.rllib.execution.rollout_ops import ParallelRollouts, ConcatBatches, \
++    StandardizeFields, SelectExperiences
++from ray.rllib.execution.train_ops import TrainOneStep, TrainTFMultiGPU
++from ray.rllib.execution.metric_ops import StandardMetricsReporting
++from ray.rllib.evaluation.metrics import collect_metrics
++
++logger = logging.getLogger(__name__)
++
++# yapf: disable
++# __sphinx_doc_begin__
++DEFAULT_CONFIG = with_common_config({
++    "ermas": {
++        "use_ermas": True,
++        "use_meta": False,
++        "inner_adaptation_steps": 4,
++        "penalty": "reptile",
++        "freeze_alpha": True,
++        "initial_lambda": 1.,
++        "alpha_lr": 0.01,
++        "epsilon": 0.001,
++    },
++    # Should use a critic as a baseline (otherwise don't use value baseline;
++    # required for using GAE).
++    "use_critic": True,
++    # If true, use the Generalized Advantage Estimator (GAE)
++    # with a value function, see https://arxiv.org/pdf/1506.02438.pdf.
++    "use_gae": True,
++    # The GAE(lambda) parameter.
++    "lambda": 1.0,
++    # Initial coefficient for KL divergence.
++    "kl_coeff": 0.2,
++    # Size of batches collected from each worker.
++    "rollout_fragment_length": 200,
++    # Number of timesteps collected for each SGD round. This defines the size
++    # of each SGD epoch.
++    "train_batch_size": 4000,
++    # Total SGD batch size across all devices for SGD. This defines the
++    # minibatch size within each epoch.
++    "sgd_minibatch_size": 128,
++    # Whether to shuffle sequences in the batch when training (recommended).
++    "shuffle_sequences": True,
++    # Number of SGD iterations in each outer loop (i.e., number of epochs to
++    # execute per train batch).
++    "num_sgd_iter": 30,
++    # Stepsize of SGD.
++    "lr": 5e-5,
++    # Learning rate schedule.
++    "lr_schedule": None,
++    # Share layers for value function. If you set this to True, it's important
++    # to tune vf_loss_coeff.
++    "vf_share_layers": False,
++    # Coefficient of the value function loss. IMPORTANT: you must tune this if
++    # you set vf_share_layers: True.
++    "vf_loss_coeff": 1.0,
++    # Coefficient of the entropy regularizer.
++    "entropy_coeff": 0.0,
++    # Decay schedule for the entropy regularizer.
++    "entropy_coeff_schedule": None,
++    # PPO clip parameter.
++    "clip_param": 0.3,
++    # Clip param for the value function. Note that this is sensitive to the
++    # scale of the rewards. If your expected V is large, increase this.
++    "vf_clip_param": 10.0,
++    # If specified, clip the global norm of gradients by this amount.
++    "grad_clip": None,
++    # Target value for KL divergence.
++    "kl_target": 0.01,
++    # Whether to rollout "complete_episodes" or "truncate_episodes".
++    "batch_mode": "truncate_episodes",
++    # Which observation filter to apply to the observation.
++    "observation_filter": "NoFilter",
++    # Uses the sync samples optimizer instead of the multi-gpu one. This is
++    # usually slower, but you might want to try it if you run into issues with
++    # the default optimizer.
++    "simple_optimizer": False,
++    # Whether to fake GPUs (using CPUs).
++    # Set this to True for debugging on non-GPU machines (set `num_gpus` > 0).
++    "_fake_gpus": False,
++})
++# __sphinx_doc_end__
++# yapf: enable
++
++
++def warn_about_bad_reward_scales(config, result):
++    if result["policy_reward_mean"]:
++        return result  # Punt on handling multiagent case.
++
++    # Warn about excessively high VF loss.
++    learner_stats = result["info"]["learner"]
++    if "default_policy" in learner_stats:
++        scaled_vf_loss = (config["vf_loss_coeff"] *
++                          learner_stats["default_policy"]["vf_loss"])
++        policy_loss = learner_stats["default_policy"]["policy_loss"]
++        if config["vf_share_layers"] and scaled_vf_loss > 100:
++            logger.warning(
++                "The magnitude of your value function loss is extremely large "
++                "({}) compared to the policy loss ({}). This can prevent the "
++                "policy from learning. Consider scaling down the VF loss by "
++                "reducing vf_loss_coeff, or disabling vf_share_layers.".format(
++                    scaled_vf_loss, policy_loss))
++
++    # Warn about bad clipping configs
++    if config["vf_clip_param"] <= 0:
++        rew_scale = float("inf")
++    else:
++        rew_scale = round(
++            abs(result["episode_reward_mean"]) / config["vf_clip_param"], 0)
++    if rew_scale > 200:
++        logger.warning(
++            "The magnitude of your environment rewards are more than "
++            "{}x the scale of `vf_clip_param`. ".format(rew_scale) +
++            "This means that it will take more than "
++            "{} iterations for your value ".format(rew_scale) +
++            "function to converge. If this is not intended, consider "
++            "increasing `vf_clip_param`.")
++
++    return result
++
++
++def validate_config(config):
++    if config["entropy_coeff"] < 0:
++        raise DeprecationWarning("entropy_coeff must be >= 0")
++    if isinstance(config["entropy_coeff"], int):
++        config["entropy_coeff"] = float(config["entropy_coeff"])
++    if config["sgd_minibatch_size"] > config["train_batch_size"]:
++        raise ValueError("`sgd_minibatch_size` ({}) must be <= "
++                         "`train_batch_size` ({}).".format(
++                             config["sgd_minibatch_size"],
++                             config["train_batch_size"]))
++    if config["batch_mode"] == "truncate_episodes" and not config["use_gae"]:
++        raise ValueError(
++            "Episode truncation is not supported without a value "
++            "function. Consider setting batch_mode=complete_episodes.")
++    if config["multiagent"]["policies"] and not config["simple_optimizer"]:
++        logger.info(
++            "In multi-agent mode, policies will be optimized sequentially "
++            "by the multi-GPU optimizer. Consider setting "
++            "simple_optimizer=True if this doesn't work for you.")
++    if config["simple_optimizer"]:
++        logger.warning(
++            "Using the simple minibatch optimizer. This will significantly "
++            "reduce performance, consider simple_optimizer=False.")
++    # Multi-gpu not supported for PyTorch and tf-eager.
++    elif config["framework"] in ["tf2", "tfe", "torch"]:
++        config["simple_optimizer"] = True
++
++
++def get_policy_class(config):
++    if config["framework"] == "torch":
++        from ray.rllib.agents.ppo.ppo_torch_policy import PPOTorchPolicy
++        return PPOTorchPolicy
++    else:
++        return PPOTFPolicy
++
++
++class UpdateKL:
++    """Callback to update the KL based on optimization info."""
++
++    def __init__(self, workers):
++        self.workers = workers
++
++    def __call__(self, fetches):
++        def update(pi, pi_id):
++            assert "kl" not in fetches, (
++                "kl should be nested under policy id key", fetches)
++            if pi_id in fetches:
++                assert "kl" in fetches[pi_id], (fetches, pi_id)
++                pi.update_kl(fetches[pi_id]["kl"])
++            else:
++                logger.warning("No data for {}, not updating kl".format(pi_id))
++
++        self.workers.local_worker().foreach_trainable_policy(update)
++
++
++def execution_plan(workers, config):
++    rollouts = ParallelRollouts(workers, mode="bulk_sync")
++
++    # Collect large batches of relevant experiences & standardize.
++    rollouts = rollouts.for_each(
++        SelectExperiences(workers.trainable_policies()))
++    rollouts = rollouts.combine(
++        ConcatBatches(min_batch_size=config["train_batch_size"]))
++    rollouts = rollouts.for_each(StandardizeFields(["advantages"]))
++
++    inner_steps = config["ermas"]["inner_adaptation_steps"]
++
++    def inner_adaptation_steps(itr):
++        # Initialize update kl and train_op operators
++        update_kl = UpdateKL(workers)
++        if config["simple_optimizer"]:
++            train_op = TrainOneStep(
++                    workers,
++                    num_sgd_iter=config["num_sgd_iter"],
++                    sgd_minibatch_size=config["sgd_minibatch_size"])
++        else:
++            train_op = TrainTFMultiGPU(
++                    workers,
++                    sgd_minibatch_size=config["sgd_minibatch_size"],
++                    num_sgd_iter=config["num_sgd_iter"],
++                    num_gpus=config["num_gpus"],
++                    rollout_fragment_length=config["rollout_fragment_length"],
++                    num_envs_per_worker=config["num_envs_per_worker"],
++                    train_batch_size=config["train_batch_size"],
++                    shuffle_sequences=config["shuffle_sequences"],
++                    _fake_gpus=config["_fake_gpus"],
++                    framework=config.get("framework"))
++
++        # Track stats
++        step_i = 0
++        last_stats = None
++        for samples in itr:
++            if step_i >= inner_steps:
++                assert last_stats
++                yield last_stats
++                step_i = 0
++                last_stats = {}
++            else:
++                # Get update
++                samples, stats = train_op(samples)
++                last_stats = stats
++                update_kl(stats)
++                step_i += 1
++
++    train_op = rollouts.transform(inner_adaptation_steps)
++    return StandardMetricsReporting(train_op, workers, config) \
++        .for_each(lambda result: warn_about_bad_reward_scales(config, result))
++
++
++LPPOTrainer = build_trainer(
++    name="LPPO",
++    default_config=DEFAULT_CONFIG,
++    default_policy=PPOTFPolicy,
++    get_policy_class=get_policy_class,
++    execution_plan=execution_plan,
++    validate_config=validate_config)
+diff --git a/rllib/agents/wppo/wppo.py b/rllib/agents/wppo/wppo.py
+new file mode 100644
+index 000000000..d903bf133
+--- /dev/null
++++ b/rllib/agents/wppo/wppo.py
+@@ -0,0 +1,222 @@
++import logging
++
++from ray.rllib.agents import with_common_config
++from ray.rllib.agents.wppo.wppo_tf_policy import WPPOTFPolicy
++from ray.rllib.agents.trainer_template import build_trainer
++from ray.rllib.execution.rollout_ops import ParallelRollouts, ConcatBatches, \
++    StandardizeFields, SelectExperiences
++from ray.rllib.execution.train_ops import TrainOneStep, TrainTFMultiGPU
++from ray.rllib.execution.metric_ops import StandardMetricsReporting
++
++logger = logging.getLogger(__name__)
++
++# yapf: disable
++# __sphinx_doc_begin__
++DEFAULT_CONFIG = with_common_config({
++    # Should use a critic as a baseline (otherwise don't use value baseline;
++    # required for using GAE).
++    "use_critic": True,
++    # If true, use the Generalized Advantage Estimator (GAE)
++    # with a value function, see https://arxiv.org/pdf/1506.02438.pdf.
++    "use_gae": True,
++    # The GAE(lambda) parameter.
++    "lambda": 1.0,
++    # Initial coefficient for KL divergence.
++    "kl_coeff": 0.2,
++    # Initial coefficient for lambda.
++    "lambda_coeff": 1.0,
++    # Size of batches collected from each worker.
++    "rollout_fragment_length": 200,
++    # Number of timesteps collected for each SGD round. This defines the size
++    # of each SGD epoch.
++    "train_batch_size": 4000,
++    # Total SGD batch size across all devices for SGD. This defines the
++    # minibatch size within each epoch.
++    "sgd_minibatch_size": 128,
++    # Whether to shuffle sequences in the batch when training (recommended).
++    "shuffle_sequences": True,
++    # Number of SGD iterations in each outer loop (i.e., number of epochs to
++    # execute per train batch).
++    "num_sgd_iter": 30,
++    # Stepsize of SGD.
++    "lr": 5e-5,
++    # Learning rate schedule.
++    "lr_schedule": None,
++    # Share layers for value function. If you set this to True, it's important
++    # to tune vf_loss_coeff.
++    "vf_share_layers": False,
++    # Coefficient of the value function loss. IMPORTANT: you must tune this if
++    # you set vf_share_layers: True.
++    "vf_loss_coeff": 1.0,
++    # Coefficient of the entropy regularizer.
++    "entropy_coeff": 0.0,
++    # Decay schedule for the entropy regularizer.
++    "entropy_coeff_schedule": None,
++    # PPO clip parameter.
++    "clip_param": 0.3,
++    # Clip param for the value function. Note that this is sensitive to the
++    # scale of the rewards. If your expected V is large, increase this.
++    "vf_clip_param": 10.0,
++    # If specified, clip the global norm of gradients by this amount.
++    "grad_clip": None,
++    # Target value for KL divergence.
++    "kl_target": 0.01,
++    # Whether to rollout "complete_episodes" or "truncate_episodes".
++    "batch_mode": "truncate_episodes",
++    # Which observation filter to apply to the observation.
++    "observation_filter": "NoFilter",
++    # Uses the sync samples optimizer instead of the multi-gpu one. This is
++    # usually slower, but you might want to try it if you run into issues with
++    # the default optimizer.
++    "simple_optimizer": False,
++    # Whether to fake GPUs (using CPUs).
++    # Set this to True for debugging on non-GPU machines (set `num_gpus` > 0).
++    "_fake_gpus": False,
++})
++# __sphinx_doc_end__
++# yapf: enable
++
++
++def warn_about_bad_reward_scales(config, result):
++    if result["policy_reward_mean"]:
++        return result  # Punt on handling multiagent case.
++
++    # Warn about excessively high VF loss.
++    learner_stats = result["info"]["learner"]
++    if "default_policy" in learner_stats:
++        scaled_vf_loss = (config["vf_loss_coeff"] *
++                          learner_stats["default_policy"]["vf_loss"])
++        policy_loss = learner_stats["default_policy"]["policy_loss"]
++        if config["vf_share_layers"] and scaled_vf_loss > 100:
++            logger.warning(
++                "The magnitude of your value function loss is extremely large "
++                "({}) compared to the policy loss ({}). This can prevent the "
++                "policy from learning. Consider scaling down the VF loss by "
++                "reducing vf_loss_coeff, or disabling vf_share_layers.".format(
++                    scaled_vf_loss, policy_loss))
++
++    # Warn about bad clipping configs
++    if config["vf_clip_param"] <= 0:
++        rew_scale = float("inf")
++    else:
++        rew_scale = round(
++            abs(result["episode_reward_mean"]) / config["vf_clip_param"], 0)
++    if rew_scale > 200:
++        logger.warning(
++            "The magnitude of your environment rewards are more than "
++            "{}x the scale of `vf_clip_param`. ".format(rew_scale) +
++            "This means that it will take more than "
++            "{} iterations for your value ".format(rew_scale) +
++            "function to converge. If this is not intended, consider "
++            "increasing `vf_clip_param`.")
++
++    return result
++
++
++def validate_config(config):
++    if config["entropy_coeff"] < 0:
++        raise DeprecationWarning("entropy_coeff must be >= 0")
++    if isinstance(config["entropy_coeff"], int):
++        config["entropy_coeff"] = float(config["entropy_coeff"])
++    if config["sgd_minibatch_size"] > config["train_batch_size"]:
++        raise ValueError("`sgd_minibatch_size` ({}) must be <= "
++                         "`train_batch_size` ({}).".format(
++                             config["sgd_minibatch_size"],
++                             config["train_batch_size"]))
++    if config["batch_mode"] == "truncate_episodes" and not config["use_gae"]:
++        raise ValueError(
++            "Episode truncation is not supported without a value "
++            "function. Consider setting batch_mode=complete_episodes.")
++    if config["multiagent"]["policies"] and not config["simple_optimizer"]:
++        logger.info(
++            "In multi-agent mode, policies will be optimized sequentially "
++            "by the multi-GPU optimizer. Consider setting "
++            "simple_optimizer=True if this doesn't work for you.")
++    if config["simple_optimizer"]:
++        logger.warning(
++            "Using the simple minibatch optimizer. This will significantly "
++            "reduce performance, consider simple_optimizer=False.")
++    # Multi-gpu not supported for PyTorch and tf-eager.
++    elif config["framework"] in ["tf2", "tfe", "torch"]:
++        config["simple_optimizer"] = True
++
++
++def get_policy_class(config):
++    if config["framework"] == "torch":
++        raise NotImplementedError("No Torch weighted PPO implementation.")
++    else:
++        return config["multiagent"]["policies"]
++
++
++def update_lambda(self, lambda_coeff):
++    """Callback to update the lambda based on optimization info."""
++    def update(pi, pi_id):
++        if pi_id != "p":
++            pi.update_lambda(lambda_coeff)
++    self.workers.local_worker().foreach_trainable_policy(update)
++
++
++class UpdateKL:
++    """Callback to update the KL based on optimization info."""
++
++    def __init__(self, workers):
++        self.workers = workers
++
++    def __call__(self, fetches):
++        def update(pi, pi_id):
++            assert "kl" not in fetches, (
++                "kl should be nested under policy id key", fetches)
++            if pi_id in fetches:
++                assert "kl" in fetches[pi_id], (fetches, pi_id)
++                pi.update_kl(fetches[pi_id]["kl"])
++            else:
++                logger.warning("No data for {}, not updating kl".format(pi_id))
++
++        self.workers.local_worker().foreach_trainable_policy(update)
++
++
++def execution_plan(workers, config):
++    rollouts = ParallelRollouts(workers, mode="bulk_sync")
++
++    # Collect large batches of relevant experiences & standardize.
++    rollouts = rollouts.for_each(
++        SelectExperiences(workers.trainable_policies()))
++    rollouts = rollouts.combine(
++        ConcatBatches(min_batch_size=config["train_batch_size"]))
++    rollouts = rollouts.for_each(StandardizeFields(["advantages"]))
++
++    if config["simple_optimizer"]:
++        train_op = rollouts.for_each(
++            TrainOneStep(
++                workers,
++                num_sgd_iter=config["num_sgd_iter"],
++                sgd_minibatch_size=config["sgd_minibatch_size"]))
++    else:
++        train_op = rollouts.for_each(
++            TrainTFMultiGPU(
++                workers,
++                sgd_minibatch_size=config["sgd_minibatch_size"],
++                num_sgd_iter=config["num_sgd_iter"],
++                num_gpus=config["num_gpus"],
++                rollout_fragment_length=config["rollout_fragment_length"],
++                num_envs_per_worker=config["num_envs_per_worker"],
++                train_batch_size=config["train_batch_size"],
++                shuffle_sequences=config["shuffle_sequences"],
++                _fake_gpus=config["_fake_gpus"],
++                framework=config.get("framework")))
++
++    # Update KL after each round of training.
++    train_op = train_op.for_each(lambda t: t[1]).for_each(UpdateKL(workers))
++
++    return StandardMetricsReporting(train_op, workers, config) \
++        .for_each(lambda result: warn_about_bad_reward_scales(config, result))
++
++
++WPPOTrainer = build_trainer(
++    name="WPPO",
++    default_config=DEFAULT_CONFIG,
++    default_policy=WPPOTFPolicy,
++    get_policy_class=get_policy_class,
++    execution_plan=execution_plan,
++    validate_config=validate_config)
++setattr(WPPOTrainer, "update_lambda", update_lambda)
+diff --git a/rllib/agents/wppo/wppo_tf_policy.py b/rllib/agents/wppo/wppo_tf_policy.py
+new file mode 100644
+index 000000000..1c38c97a8
+--- /dev/null
++++ b/rllib/agents/wppo/wppo_tf_policy.py
+@@ -0,0 +1,329 @@
++import logging
++
++import ray
++from ray.rllib.evaluation.postprocessing import compute_advantages, \
++    Postprocessing
++from ray.rllib.policy.sample_batch import SampleBatch
++from ray.rllib.policy.tf_policy import LearningRateSchedule, \
++    EntropyCoeffSchedule
++from ray.rllib.policy.tf_policy_template import build_tf_policy
++from ray.rllib.utils.framework import try_import_tf, get_variable
++from ray.rllib.utils.tf_ops import explained_variance, make_tf_callable
++from ray.rllib.utils.sgd import standardized
++import numpy as np
++
++tf1, tf, tfv = try_import_tf()
++
++logger = logging.getLogger(__name__)
++
++PLANNER_ADVANTAGES = "planner_advantages"
++
++
++class WPPOLoss:
++    def __init__(self,
++                 dist_class,
++                 model,
++                 agent_ids,
++                 value_targets,
++                 advantages,
++                 planner_advantages,
++                 actions,
++                 prev_logits,
++                 prev_actions_logp,
++                 vf_preds,
++                 curr_action_dist,
++                 value_fn,
++                 cur_kl_coeff,
++                 cur_lambda_coeff,
++                 valid_mask,
++                 entropy_coeff=0,
++                 clip_param=0.1,
++                 vf_clip_param=0.1,
++                 vf_loss_coeff=1.0,
++                 use_gae=True):
++        """Constructs the loss for Proximal Policy Objective.
++
++        Arguments:
++            dist_class: action distribution class for logits.
++            value_targets (Placeholder): Placeholder for target values; used
++                for GAE.
++            actions (Placeholder): Placeholder for actions taken
++                from previous model evaluation.
++            advantages (Placeholder): Placeholder for calculated advantages
++                from previous model evaluation.
++            planner_advantages (Placeholder): Placeholder for calculated advantages
++                from previous model evaluation for the planner.
++            prev_logits (Placeholder): Placeholder for logits output from
++                previous model evaluation.
++            prev_actions_logp (Placeholder): Placeholder for action prob output
++                from the previous (before update) Model evaluation.
++            vf_preds (Placeholder): Placeholder for value function output
++                from the previous (before update) Model evaluation.
++            curr_action_dist (ActionDistribution): ActionDistribution
++                of the current model.
++            value_fn (Tensor): Current value function output Tensor.
++            cur_kl_coeff (Variable): Variable holding the current WPPO KL
++                coefficient.
++            cur_lambda_coeff (Variable): Variable holding the current WPPO lambda.
++            valid_mask (Optional[tf.Tensor]): An optional bool mask of valid
++                input elements (for max-len padded sequences (RNNs)).
++            entropy_coeff (float): Coefficient of the entropy regularizer.
++            clip_param (float): Clip parameter
++            vf_clip_param (float): Clip parameter for the value function
++            vf_loss_coeff (float): Coefficient of the value function loss
++            use_gae (bool): If true, use the Generalized Advantage Estimator.
++        """
++        if valid_mask is not None:
++
++            def reduce_mean_valid(t):
++                return tf.reduce_mean(tf.boolean_mask(t, valid_mask))
++
++        else:
++
++            def reduce_mean_valid(t):
++                return tf.reduce_mean(t)
++
++        prev_dist = dist_class(prev_logits, model)
++        # Make loss functions.
++        logp_ratio = tf.exp(curr_action_dist.logp(actions) - prev_actions_logp)
++        action_kl = prev_dist.kl(curr_action_dist)
++        self.mean_kl = reduce_mean_valid(action_kl)
++
++        curr_entropy = curr_action_dist.entropy()
++        self.mean_entropy = reduce_mean_valid(curr_entropy)
++
++        surrogate_loss = tf.minimum(
++            advantages * logp_ratio,
++            advantages * tf.clip_by_value(logp_ratio, 1 - clip_param,
++                                          1 + clip_param))
++
++        planner_surrogate_loss = tf.minimum(
++            planner_advantages * logp_ratio,
++            planner_advantages * tf.clip_by_value(logp_ratio, 1 - clip_param,
++                                          1 + clip_param))
++
++        lambda_param = tf.gather(cur_lambda_coeff, agent_ids)
++        both_surrogate_loss = (planner_surrogate_loss - lambda_param * surrogate_loss) / (1 + lambda_param)
++
++        self.mean_policy_loss = reduce_mean_valid(-surrogate_loss)
++        self.mean_adv_policy_loss = reduce_mean_valid(planner_surrogate_loss)
++        self.mean_both_policy_loss = reduce_mean_valid(both_surrogate_loss)
++
++
++        if use_gae:
++            vf_loss1 = tf.math.square(value_fn - value_targets)
++            vf_clipped = vf_preds + tf.clip_by_value(
++                value_fn - vf_preds, -vf_clip_param, vf_clip_param)
++            vf_loss2 = tf.math.square(vf_clipped - value_targets)
++            vf_loss = tf.maximum(vf_loss1, vf_loss2)
++            self.mean_vf_loss = reduce_mean_valid(vf_loss)
++            loss = reduce_mean_valid(
++                both_surrogate_loss + cur_kl_coeff * action_kl +
++                vf_loss_coeff * vf_loss - entropy_coeff * curr_entropy)
++        else:
++            self.mean_vf_loss = tf.constant(0.0)
++            loss = reduce_mean_valid(both_surrogate_loss +
++                                     cur_kl_coeff * action_kl -
++                                     entropy_coeff * curr_entropy)
++        self.loss = loss
++
++
++def wppo_surrogate_loss(policy, model, dist_class, train_batch):
++    logits, state = model.from_batch(train_batch)
++    action_dist = dist_class(logits, model)
++
++    mask = None
++    if state:
++        max_seq_len = tf.reduce_max(train_batch["seq_lens"])
++        mask = tf.sequence_mask(train_batch["seq_lens"], max_seq_len)
++        mask = tf.reshape(mask, [-1])
++
++    policy.loss_obj = WPPOLoss(
++        dist_class,
++        model,
++        train_batch["agent_id"],
++        train_batch[Postprocessing.VALUE_TARGETS],
++        train_batch[Postprocessing.ADVANTAGES],
++        train_batch[Postprocessing.PLANNER_ADVANTAGES],
++        train_batch[SampleBatch.ACTIONS],
++        train_batch[SampleBatch.ACTION_DIST_INPUTS],
++        train_batch[SampleBatch.ACTION_LOGP],
++        train_batch[SampleBatch.VF_PREDS],
++        action_dist,
++        model.value_function(),
++        policy.kl_coeff,
++        policy.lambda_coeff,
++        mask,
++        entropy_coeff=policy.entropy_coeff,
++        clip_param=policy.config["clip_param"],
++        vf_clip_param=policy.config["vf_clip_param"],
++        vf_loss_coeff=policy.config["vf_loss_coeff"],
++        use_gae=policy.config["use_gae"],
++    )
++
++    return policy.loss_obj.loss
++
++
++def kl_and_loss_stats(policy, train_batch):
++    return {
++        "cur_kl_coeff": tf.cast(policy.kl_coeff, tf.float64),
++        "cur_lambda_coeff": tf.cast(policy.lambda_coeff, tf.float64),
++        "cur_lr": tf.cast(policy.cur_lr, tf.float64),
++        "total_loss": policy.loss_obj.loss,
++        "me_policy_loss": policy.loss_obj.mean_policy_loss,
++        "adv_policy_loss": policy.loss_obj.mean_adv_policy_loss,
++        "joint_policy_loss": policy.loss_obj.mean_both_policy_loss,
++        "vf_loss": policy.loss_obj.mean_vf_loss,
++        "vf_explained_var": explained_variance(
++            train_batch[Postprocessing.VALUE_TARGETS],
++            policy.model.value_function()),
++        "kl": policy.loss_obj.mean_kl,
++        "entropy": policy.loss_obj.mean_entropy,
++        "entropy_coeff": tf.cast(policy.entropy_coeff, tf.float64),
++    }
++
++
++def vf_preds_fetches(policy):
++    """Adds value function outputs to experience train_batches."""
++    return {
++        SampleBatch.VF_PREDS: policy.model.value_function(),
++    }
++
++
++def postprocess_wppo_gae(policy,
++                        sample_batch,
++                        other_agent_batches=None,
++                        episode=None):
++    """Adds the policy logits, VF preds, and advantages to the trajectory."""
++
++    completed = sample_batch[SampleBatch.DONES][-1]
++    if completed:
++        last_r = 0.0
++    else:
++        next_state = []
++        for i in range(policy.num_state_tensors()):
++            next_state.append(sample_batch["state_out_{}".format(i)][-1])
++        last_r = policy._value(sample_batch[SampleBatch.NEXT_OBS][-1],
++                               sample_batch[SampleBatch.ACTIONS][-1],
++                               sample_batch[SampleBatch.REWARDS][-1],
++                               *next_state)
++    batch = compute_advantages(
++        sample_batch,
++        last_r,
++        policy.config["gamma"],
++        policy.config["lambda"],
++        use_gae=policy.config["use_gae"])
++    if "p" in other_agent_batches:
++        planner_batch = other_agent_batches["p"]
++        assert "agent_id" in batch
++        batch[PLANNER_ADVANTAGES] = standardized(planner_batch[Postprocessing.ADVANTAGES])
++        if len(batch[PLANNER_ADVANTAGES]) != len(batch[Postprocessing.ADVANTAGES]):
++            # If we are longer than advantage
++            batch[PLANNER_ADVANTAGES] = batch[PLANNER_ADVANTAGES][:len(batch[Postprocessing.ADVANTAGES])]
++            # If advantage is longer than us
++            batch[PLANNER_ADVANTAGES] = np.pad(batch[PLANNER_ADVANTAGES], (0, len(batch[Postprocessing.ADVANTAGES]) - len(batch[PLANNER_ADVANTAGES])))
++    else:
++         batch[PLANNER_ADVANTAGES] = np.zeros_like(batch[Postprocessing.ADVANTAGES])
++
++    return batch
++
++
++def clip_gradients(policy, optimizer, loss):
++    variables = policy.model.trainable_variables()
++    if policy.config["grad_clip"] is not None:
++        grads_and_vars = optimizer.compute_gradients(loss, variables)
++        grads = [g for (g, v) in grads_and_vars]
++        policy.grads, _ = tf.clip_by_global_norm(grads,
++                                                 policy.config["grad_clip"])
++        clipped_grads = list(zip(policy.grads, variables))
++        return clipped_grads
++    else:
++        return optimizer.compute_gradients(loss, variables)
++
++
++class LambdaMixin:
++    def __init__(self, config):
++        # Lagrange multipliers
++        self.lambda_coeff_val = config["lambda_coeff"]
++        self.lambda_coeff = get_variable(
++            [float(self.lambda_coeff_val)] * config["env_config"]["env_config_dict"]["n_agents"],
++            tf_name="lambda_coeff", trainable=False)
++
++    def update_lambda(self, new_lambda):
++        self.lambda_coeff_val = new_lambda
++        self.lambda_coeff.load(self.lambda_coeff_val, session=self.get_session())
++        return self.lambda_coeff_val
++
++
++class KLCoeffMixin:
++    def __init__(self, config):
++        # KL Coefficient
++        self.kl_coeff_val = config["kl_coeff"]
++        self.kl_target = config["kl_target"]
++        self.kl_coeff = get_variable(
++            float(self.kl_coeff_val), tf_name="kl_coeff", trainable=False)
++
++    def update_kl(self, sampled_kl):
++        if sampled_kl > 2.0 * self.kl_target:
++            self.kl_coeff_val *= 1.5
++        elif sampled_kl < 0.5 * self.kl_target:
++            self.kl_coeff_val *= 0.5
++        self.kl_coeff.load(self.kl_coeff_val, session=self.get_session())
++        return self.kl_coeff_val
++
++
++class ValueNetworkMixin:
++    def __init__(self, obs_space, action_space, config):
++        if config["use_gae"]:
++
++            @make_tf_callable(self.get_session())
++            def value(ob, prev_action, prev_reward, *state):
++                model_out, _ = self.model({
++                    SampleBatch.CUR_OBS: tf.convert_to_tensor([ob]),
++                    SampleBatch.PREV_ACTIONS: tf.convert_to_tensor(
++                        [prev_action]),
++                    SampleBatch.PREV_REWARDS: tf.convert_to_tensor(
++                        [prev_reward]),
++                    "is_training": tf.convert_to_tensor([False]),
++                }, [tf.convert_to_tensor([s]) for s in state],
++                                          tf.convert_to_tensor([1]))
++                return self.model.value_function()[0]
++
++        else:
++
++            @make_tf_callable(self.get_session())
++            def value(ob, prev_action, prev_reward, *state):
++                return tf.constant(0.0)
++
++        self._value = value
++
++
++def setup_config(policy, obs_space, action_space, config):
++    # auto set the model option for layer sharing
++    config["model"]["vf_share_layers"] = config["vf_share_layers"]
++
++
++def setup_mixins(policy, obs_space, action_space, config):
++    ValueNetworkMixin.__init__(policy, obs_space, action_space, config)
++    KLCoeffMixin.__init__(policy, config)
++    LambdaMixin.__init__(policy, config)
++    EntropyCoeffSchedule.__init__(policy, config["entropy_coeff"],
++                                  config["entropy_coeff_schedule"])
++    LearningRateSchedule.__init__(policy, config["lr"], config["lr_schedule"])
++
++
++WPPOTFPolicy = build_tf_policy(
++    name="WPPOTFPolicy",
++    get_default_config=lambda: ray.rllib.agents.wppo.wppo.DEFAULT_CONFIG,
++    loss_fn=wppo_surrogate_loss,
++    stats_fn=kl_and_loss_stats,
++    extra_action_fetches_fn=vf_preds_fetches,
++    postprocess_fn=postprocess_wppo_gae,
++    gradients_fn=clip_gradients,
++    before_init=setup_config,
++    before_loss_init=setup_mixins,
++    mixins=[
++        LearningRateSchedule, EntropyCoeffSchedule, KLCoeffMixin,
++        ValueNetworkMixin,
++        LambdaMixin,
++    ])
+diff --git a/rllib/evaluation/metrics.py b/rllib/evaluation/metrics.py
+index 3f0ef4122..a770634b4 100644
+--- a/rllib/evaluation/metrics.py
++++ b/rllib/evaluation/metrics.py
+@@ -106,6 +106,7 @@ def summarize_episodes(
+     episode_rewards = []
+     episode_lengths = []
+     policy_rewards = collections.defaultdict(list)
++    agent_rewards = collections.defaultdict(list)
+     custom_metrics = collections.defaultdict(list)
+     perf_stats = collections.defaultdict(list)
+     hist_stats = collections.defaultdict(list)
+@@ -116,7 +117,8 @@ def summarize_episodes(
+             custom_metrics[k].append(v)
+         for k, v in episode.perf_stats.items():
+             perf_stats[k].append(v)
+-        for (_, policy_id), reward in episode.agent_rewards.items():
++        for (agent_id, policy_id), reward in episode.agent_rewards.items():
++            agent_rewards[agent_id].append(reward)
+             if policy_id != DEFAULT_POLICY_ID:
+                 policy_rewards[policy_id].append(reward)
+         for k, v in episode.hist_data.items():
+@@ -149,6 +151,17 @@ def summarize_episodes(
+         # Show as histogram distributions.
+         hist_stats["policy_{}_reward".format(policy_id)] = rewards
+ 
++    agent_reward_min = {}
++    agent_reward_mean = {}
++    agent_reward_max = {}
++    for agent_id, rewards in agent_rewards.copy().items():
++        agent_reward_min[agent_id] = np.min(rewards)
++        agent_reward_mean[agent_id] = np.mean(rewards)
++        agent_reward_max[agent_id] = np.max(rewards)
++
++        # Show as histogram distributions.
++        hist_stats["agent_{}_reward".format(agent_id)] = rewards
++
+     for k, v_list in custom_metrics.copy().items():
+         filt = [v for v in v_list if not np.isnan(v)]
+         custom_metrics[k + "_mean"] = np.mean(filt)
+@@ -182,6 +195,9 @@ def summarize_episodes(
+         policy_reward_min=policy_reward_min,
+         policy_reward_max=policy_reward_max,
+         policy_reward_mean=policy_reward_mean,
++        agent_reward_min=agent_reward_min,
++        agent_reward_max=agent_reward_max,
++        agent_reward_mean=agent_reward_mean,
+         custom_metrics=dict(custom_metrics),
+         hist_stats=dict(hist_stats),
+         sampler_perf=dict(perf_stats),
+diff --git a/rllib/evaluation/postprocessing.py b/rllib/evaluation/postprocessing.py
+index 11a31562a..54dbdfde6 100644
+--- a/rllib/evaluation/postprocessing.py
++++ b/rllib/evaluation/postprocessing.py
+@@ -12,6 +12,7 @@ class Postprocessing:
+     """Constant definitions for postprocessing."""
+ 
+     ADVANTAGES = "advantages"
++    PLANNER_ADVANTAGES = "planner_advantages"
+     VALUE_TARGETS = "value_targets"
+ 
+ 
+diff --git a/rllib/evaluation/sample_batch_builder.py b/rllib/evaluation/sample_batch_builder.py
+index f5e3b002f..67a198e2c 100644
+--- a/rllib/evaluation/sample_batch_builder.py
++++ b/rllib/evaluation/sample_batch_builder.py
+@@ -181,7 +181,17 @@ class MultiAgentSampleBatchBuilder:
+                     pre_batch["rewards"],
+                     a_min=-self.clip_rewards,
+                     a_max=self.clip_rewards)
+-        for agent_id, (_, pre_batch) in pre_batches.items():
++
++        # Is planner an agent?
++        is_planner = "p" in pre_batches
++        if is_planner:
++            agent_ids = [k for k in pre_batches.keys() if k != "p"]
++            agent_ids = ["p"] + agent_ids
++        else:
++            agent_ids = pre_batches.keys()
++
++        for agent_id in agent_ids:
++            (_, pre_batch) = pre_batches[agent_id]
+             other_batches = pre_batches.copy()
+             del other_batches[agent_id]
+             policy = self.policy_map[self.agent_to_policy[agent_id]]
+@@ -190,6 +200,12 @@ class MultiAgentSampleBatchBuilder:
+                 raise ValueError(
+                     "Batches sent to postprocessing must only contain steps "
+                     "from a single trajectory.", pre_batch)
++
++            if is_planner and agent_id != "p":
++                other_batches["p"] = post_batches["p"]
++
++            pre_batch["agent_id"] = np.ones_like(pre_batch["dones"]) * (-1 if agent_id == "p" else int(agent_id))
++
+             post_batches[agent_id] = policy.postprocess_trajectory(
+                 pre_batch, other_batches, episode)
+             # Call the Policy's Exploration's postprocess method.
+diff --git a/rllib/policy/dynamic_tf_policy.py b/rllib/policy/dynamic_tf_policy.py
+index 6ccc5326e..743483515 100644
+--- a/rllib/policy/dynamic_tf_policy.py
++++ b/rllib/policy/dynamic_tf_policy.py
+@@ -6,6 +6,7 @@ from typing import Callable, Dict, List, Optional, Tuple
+ 
+ from ray.util.debug import log_once
+ from ray.rllib.models.modelv2 import ModelV2
++from ray.rllib.evaluation.postprocessing import Postprocessing
+ from ray.rllib.policy.policy import Policy
+ from ray.rllib.policy.sample_batch import SampleBatch
+ from ray.rllib.policy.tf_policy import TFPolicy
+@@ -371,6 +372,9 @@ class DynamicTFPolicy(TFPolicy):
+                 SampleBatch.PREV_ACTIONS: fake_array(self._prev_action_input),
+                 SampleBatch.PREV_REWARDS: fake_array(self._prev_reward_input),
+             })
++
++        dummy_planner_batch = {Postprocessing.ADVANTAGES: fake_array(self._prev_reward_input)}
++
+         state_init = self.get_initial_state()
+         state_batches = []
+         for i, h in enumerate(state_init):
+@@ -381,12 +385,14 @@ class DynamicTFPolicy(TFPolicy):
+             dummy_batch["seq_lens"] = np.array([1], dtype=np.int32)
+         for k, v in self.extra_compute_action_fetches().items():
+             dummy_batch[k] = fake_array(v)
++        dummy_batch["agent_id"] = np.array([1])
+ 
+         # postprocessing might depend on variable init, so run it first here
+         self._sess.run(tf1.global_variables_initializer())
+ 
+         postprocessed_batch = self.postprocess_trajectory(
+-            SampleBatch(dummy_batch))
++            SampleBatch(dummy_batch),
++            {"p": SampleBatch(dummy_planner_batch)})
+ 
+         # model forward pass for the loss (needed after postprocess to
+         # overwrite any tensor state from that call)

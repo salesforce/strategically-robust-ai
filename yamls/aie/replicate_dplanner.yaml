@@ -1,0 +1,20 @@
+metadata:
+  experiment: aie-replicate-dplanner
+
+general:
+  remap: true
+  episodes: 1000
+  train_planner: true
+  restore_tf_weights_agents: AIE_FMARKET_AGENT_WEIGHTS
+  restore_tf_weights_planner:
+
+env:
+  isoelastic_eta: 0.23
+  components:
+  - Build: 
+  - ContinuousDoubleAuction: 
+  - Gather: 
+  - PeriodicBracketTax:
+      tax_annealing_schedule:
+      - -100
+      - 0.001
