@@ -123,7 +123,7 @@ PyYAML==5.2
 pyzmq==18.0.0
 qtconsole==4.4.3
 ray==0.8.0
-redis==3.3.11
+redis==4.5.3
 regex==2017.4.5
 requests==2.21.0
 requests-oauthlib==1.2.0
