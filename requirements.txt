@@ -39,7 +39,7 @@ gitdb2==2.0.5
 GitPython==2.1.11
 glfw==1.7.1
 gql==0.1.0
-grpcio==1.19.0
+grpcio==1.53.0
 gym==0.15.4
 h5py==2.9.0
 httplib2==0.13.1
