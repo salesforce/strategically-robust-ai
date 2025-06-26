@@ -98,7 +98,7 @@ progressbar2==3.39.2
 prometheus-client==0.6.0
 promise==2.2.1
 prompt-toolkit==2.0.9
-protobuf==3.11.2
+protobuf==3.18.3
 psutil==5.5.1
 ptyprocess==0.6.0
 py==1.8.0
